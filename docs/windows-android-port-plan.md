@@ -304,7 +304,10 @@ add one as an optional later improvement, or rely on AOT (9.3) for that.
 - Debugging game-specific JIT issues: open-ended but bounded; yuzu ran these games.
 
 **Risks.**
-- Upstream maintenance: dynarmic upstream is quiet. Pin a commit or a maintained fork, and expect to own fixes.
+- Upstream maintenance: `merryhime/dynarmic` is gone and `lioncash/dynarmic` was archived on 2024-03-03 (X-S2).
+  Pin `a41c380` in a project-owned fork, evaluate Eden's in-tree A64 fixes, and expect to own fixes.
+- No ARMv8.1 LSE in dynarmic: retail Switch code is ARMv8.0, but guest-side code this project injects (thunks,
+  patch blocks) must avoid LSE (`nvn_thunks.S` uses `stadd` today).
 - "Not an emulator" positioning: the CPU path on x86-64 becomes an emulator CPU core. Everything else stays HLE and
   native. Say so plainly in the README.
 - FP accuracy settings: dynarmic's fast-FP options trade accuracy for speed. Start accurate, then measure.
@@ -400,6 +403,29 @@ x86-64 PC.
 | X-S2 | Does dynarmic (pinned commit) run TOTK `sdk` init and `nn::init::Start` to the first NVN call, with the gate handlers reused? | Choose a different JIT (Ryujinx ARMeilleure, MIT, via NativeAOT) |
 | X-S3 | Lift 1,000 random `main` functions to C: generated size, clang time per function, Unicorn differential pass rate | Recalibrate the AOT estimate or drop AOT |
 | X-S4 | What fraction of `br`/`blr` targets does static discovery find, measured against a JIT-logged play session? | Coverage lists become mandatory, not a bonus |
+
+Results so far (2026-10-23, i7-5820K + RTX 3060; probes and full tables in
+[`games/totk/spikes/x64`](../games/totk/spikes/x64/README.md)):
+
+- **X-S1: yes.**
+  - Linked with `/HIGHENTROPYVA:NO`, a fresh process holds nothing below 2 GiB, and the macOS fixed layout landed
+    in 50/50 launches.
+  - With high-entropy ASLR, thread stacks fall below 2^39 in about half the launches. The side-by-side fallback
+    still served every launch.
+  - 4 KiB commit, protect and section double-mapping in placeholders all work.
+  - The RTX 3060 imports guest heap and aliased memory directly through `VK_EXT_external_memory_host` (4 KiB
+    alignment). `VK_EXT_map_memory_placed` is not offered.
+- **X-S2: yes on a synthetic boot path; the real `sdk` run needs the player's dumped modules.**
+  - dynarmic (pinned `a41c380`) passes the boot checks: TLR, `TPIDR_EL0`, `x18`, svc gates with the heap read by
+    plain pointer, `CNTPCT`, bit-exact `FMADD`/`FMLA`, and NVN through bootstrap-loader stubs and a signature
+    bridge (float arguments, host → guest callback).
+  - It also passes the fastmem fault fallback, exact 4-thread exclusives (64-bit, 32-bit and pairs), and
+    cross-thread halt.
+  - A load-heavy loop runs 4.3-5.1x slower than native, about 1 ns per guest instruction.
+  - Two plan changes follow:
+    1. dynarmic upstream is deleted or archived, so the project owns a fork.
+    2. dynarmic has no ARMv8.1 LSE. That is fine for retail code, which targets the ARMv8.0 Cortex-A57, but every
+       instruction this project injects into guest code must stay ARMv8.0. `nvn_thunks.S` currently uses `stadd`.
 
 #### Phase X1: CPU backend interface + ABI bridge (5-6 wk)
 - [ ] `cpu_backend.h`; the current ARM64 path becomes the `native` backend with no behavior change (Mac hash parity).
