@@ -3,6 +3,7 @@ rem Runs the conformance test, then the negative control, which must be rejected
 setlocal
 cd /d "%~dp0"
 build\bridge_test.exe || (echo conformance test failed & exit /b 1)
+build\guest_call_native.exe || (echo native GUEST_CALL test failed & exit /b 1)
 build\bridge_test_negative.exe > build\negative.txt
 if not errorlevel 1 (echo negative control was NOT rejected & type build\negative.txt & exit /b 1)
 findstr /b /c:"FAIL M arguments" build\negative.txt >nul || (echo negative control failed for another reason & type build\negative.txt & exit /b 1)

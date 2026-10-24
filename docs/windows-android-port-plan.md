@@ -459,9 +459,40 @@ Results so far (2026-10-23, i7-5820K + RTX 3060; probes and full tables in
 - [ ] Wire the `native` backend into the runtime (gate.S, hle_stack.S and threads.c behind `cpu_backend.h`). This
       needs a Mac to prove hash parity, so nothing in the Mac/iOS build changes yet: `runtime/cpu/` is outside the
       Makefile's `runtime/*.c` glob and excluded in `ios/project.yml`.
-- [ ] Bridge the non-NVN host functions: the 16 `runtime_*_override` tables plus `runtime_observer` (same
-      generator, reading each table's C function signatures). Route the 5 host → guest cast-and-call sites (e.g.
-      `observed_region` calling the guest `AllocateAddressRegion`) through `cpu_call`.
+- [x] Bridge the non-NVN host functions. `gen_cpu_bridge.py` also writes `runtime/cpu/hle_bridge.c`:
+  - **205 imports from 15 files, 39 marshallers.**
+  - Sources: the `runtime_*_override` tables, `runtime_observer`, `HLE_FORCE`, `movie_host.c`'s `NAMES[]`/`ENTRIES[]`,
+    and the `strcmp` returns.
+  - Each import is typed by its host function's own C definition. `hle_bridge_for_import()` finds the marshaller for
+    an import, so loader.c can pair it with the host function.
+  - It found two real issues:
+    1. **LLP64:** `graphics_initialize` and `seven_axis_init` took `unsigned long`, which is 32-bit on Windows. They
+       now take `size_t`, the same type on macOS.
+    2. **Struct results:** the first version sent every non-handle struct result through `x8`. AAPCS64 returns
+       structs of up to 16 bytes in `x0`/`x1`, so `ToCalendarTimeInUtc` (an 8-byte `CalendarTime`) would have been
+       written to a garbage address. Structs are now classified by size; 1–7 and 9–16 bytes, and float-only HFAs,
+       are refused until needed.
+- [x] Route host → guest calls through `GUEST_CALL(ret, fn_type, fn, args…)` / `GUEST_CALL0` (`cpu_backend.h`).
+  - The inventory is **52 sites**, not 5: the 6 observers in `services.c`, and 46 in `movie_host.c` (20 fallbacks to
+    the original `movie::Decoder` entries, 26 calls to `SignalEvent`, `movie::Buffer` and `movie::MediaData`).
+  - On ARM64 the macro expands to exactly the old cast-and-call. The routed files' native expansion was checked
+    token-identical to the previous commit.
+  - With `CPU_BACKEND_JIT` the call runs on the current guest thread through `cpu_call`.
+  - It takes integer and pointer arguments only. A `bool` result is read through `uint8_t`, because AAPCS64 leaves
+    the rest of `w0` unspecified.
+  - Not routed, and staying ARM64-only:
+    - the developer probes `memory_probe.c`, `swkbd_host.c` (probe-swkbd) and `gfx_probe.c`, which run on their own
+      host threads;
+    - `movie_host_set_guest`'s host stand-ins (probe-movie).
+  - Tests: `games/totk/tests/cpu_bridge` now runs **60,091 checks**, all passing:
+    - 96 marshallers × 200 random frames;
+    - all 205 imports found by the sorted lookup;
+    - 710 names end to end;
+    - every `GUEST_CALL` form, both under the JIT (with garbage upper bits) and natively.
+  - `tests/test_cpu_bridge.py` (19 tests) guards against stale bridges, uncovered override entries, and new direct
+    guest calls in the routed files.
+  - The Mac and iOS builds of `services.c` / `movie_host.c` (which now include `cpu/cpu_backend.h`) were not
+    compiled; they need a Mac.
 - [ ] Make `NVN`/`HLE_FORCE` registration portable: they use Mach-O `__attribute__((section("__DATA,…")))`.
 - [ ] `DM_TARGET=x64` rewriter profile (cuts and patches only) + `expected-*-x64.json` (needs the player's dump).
 - [ ] Guest-at-own-address reservation on Windows x64 in `services.c` (`VirtualAlloc2` placeholders, X-S1 layout).

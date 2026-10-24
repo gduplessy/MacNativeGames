@@ -199,6 +199,12 @@ uint64_t cpu_call(cpu_thread *t, uint64_t fn, const uint64_t *args, unsigned nar
     return result;
 }
 
+uint64_t cpu_guest_call(uint64_t fn, const uint64_t *args, unsigned nargs) {
+    cpu_thread *t = tls_current;
+    if (!t) fail(nullptr, fn, "GUEST_CALL outside a guest thread");
+    return cpu_call(t, fn, args, nargs, 0);
+}
+
 uint64_t cpu_host_entry(cpu_bridge_fn bridge, void *fn, const char *name) {
     if (!bridge || !fn) return 0;
     std::lock_guard<std::mutex> l(g_entries_mu);

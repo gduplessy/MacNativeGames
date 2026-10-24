@@ -1,6 +1,7 @@
 /* Horizon services reached by the current TOTK startup. Unknown operations fail. */
 #include "runtime.h"
 #include <TargetConditionals.h>
+#include "cpu/cpu_backend.h"   /* GUEST_CALL: the observers call the guest functions they wrap */
 #include "ipc.h"
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
@@ -254,11 +255,11 @@ static void host_fs_init(void) { runtime_fs_init(); }
 static void host_pctl_init(void) { fprintf(stderr,"[totk] local application parental controls initialized\n"); }
 static void host_abort_init(void) { fprintf(stderr,"[totk] native crash observer initialized\n"); }
 static void observed_os_init(uint64_t h,uint64_t args) {
- fprintf(stderr,"[totk] ENTER nnosInitialize\n");((void(*)(uint64_t,uint64_t))runtime_symbol("nnosInitialize"))(h,args);fprintf(stderr,"[totk] RETURN nnosInitialize\n");
+ fprintf(stderr,"[totk] ENTER nnosInitialize\n");GUEST_CALL(void,void(*)(uint64_t,uint64_t),runtime_symbol("nnosInitialize"),h,args);fprintf(stderr,"[totk] RETURN nnosInitialize\n");
 }
-static void observed_sdk_init(void) { fprintf(stderr,"[totk] ENTER nninitInitializeSdkModule\n");((void(*)(void))runtime_symbol("nninitInitializeSdkModule"))();fprintf(stderr,"[totk] RETURN nninitInitializeSdkModule\n"); }
-static void observed_startup(void) { fprintf(stderr,"[totk] ENTER nninitStartup\n");((void(*)(void))runtime_symbol("nninitStartup"))();fprintf(stderr,"[totk] RETURN nninitStartup\n"); }
-static void observed_main(void) { fprintf(stderr,"[totk] ENTER nnMain\n");((void(*)(void))runtime_symbol("nnMain"))();fprintf(stderr,"[totk] RETURN nnMain\n"); }
+static void observed_sdk_init(void) { fprintf(stderr,"[totk] ENTER nninitInitializeSdkModule\n");GUEST_CALL0(void,void(*)(void),runtime_symbol("nninitInitializeSdkModule"));fprintf(stderr,"[totk] RETURN nninitInitializeSdkModule\n"); }
+static void observed_startup(void) { fprintf(stderr,"[totk] ENTER nninitStartup\n");GUEST_CALL0(void,void(*)(void),runtime_symbol("nninitStartup"));fprintf(stderr,"[totk] RETURN nninitStartup\n"); }
+static void observed_main(void) { fprintf(stderr,"[totk] ENTER nnMain\n");GUEST_CALL0(void,void(*)(void),runtime_symbol("nnMain"));fprintf(stderr,"[totk] RETURN nnMain\n"); }
 static void cpu_boost(int mode) { if(mode<0||mode>2)runtime_fail("unknown CPU boost mode");fprintf(stderr,"[totk] CPU boost request %d: macOS manages CPU frequency\n",mode); }
 /* TOTK_OPERATION_MODE=handheld reports the Switch handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of
    docked (1, Boost 1): the game then uses its own handheld settings (1280x720 output, lower internal resolution), which
@@ -318,7 +319,7 @@ static uint64_t desired_language(void) {
    so only failures are logged unless TOTK_TRACE_ALLOC=1. */
 static int trace_alloc(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_TRACE_ALLOC");v=e&&*e&&strcmp(e,"0");}return v;}
 static uint32_t observed_region(uint64_t *out,uint64_t size){
- uint8_t *fn=runtime_symbol("_ZN2nn2os21AllocateAddressRegionEPmm");uint32_t r=((uint32_t(*)(uint64_t *,uint64_t))fn)(out,size);
+ uint8_t *fn=runtime_symbol("_ZN2nn2os21AllocateAddressRegionEPmm");uint32_t r=GUEST_CALL(uint32_t,uint32_t(*)(uint64_t *,uint64_t),fn,out,size);
  if(r||trace_alloc())fprintf(stderr,"[totk] AllocateAddressRegion size=%llx result=%x address=%llx\n",(unsigned long long)size,r,(unsigned long long)(r?0:*out));
  if(r&&getenv("TOTK_TRACE_VAMM")){
   uint8_t *sdk=fn-0x12ca60;uint64_t root;memcpy(&root,sdk+0xd16bb8,8);uint64_t *v=(void *)(uintptr_t)(root+0x418);
@@ -327,7 +328,7 @@ static uint32_t observed_region(uint64_t *out,uint64_t size){
  }
  return r;
 }
-static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=((uint32_t(*)(uint64_t,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"))(addr,size);if(r||trace_alloc())fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
+static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=GUEST_CALL(uint32_t,uint32_t(*)(uint64_t,uint64_t),runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"),addr,size);if(r||trace_alloc())fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
 void *runtime_observer(const char *name) {
  static const struct {const char *name;void *fn;} entries[]={
  {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main}};

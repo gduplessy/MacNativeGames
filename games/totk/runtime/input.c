@@ -98,7 +98,7 @@ static uint32_t show_controller_support(ControllerSupportResult *out,const void 
 /* SDK 7 (Breath of the Wild 1.6.0, botw.md). The console's own seven-axis sensor (Labo VR) is absent on a Mac: it starts and
    stops without states. Gyroscope zero-drift mode and the dual Joy-Con assignment change nothing for the host controller.
    The one-argument controller applet returns at once, as the two-argument one does (one player). */
-static uint32_t seven_axis_init(void *work,unsigned long size){(void)work;(void)size;fprintf(stderr,"[botw] seven-axis sensor: not present\n");return 0;}
+static uint32_t seven_axis_init(void *work,size_t size){(void)work;(void)size;fprintf(stderr,"[botw] seven-axis sensor: not present\n");return 0;}
 static uint32_t seven_axis_ok(void){return 0;}
 static void seven_axis_reset(void){}
 static int seven_axis_states(void *out,int count){(void)out;(void)count;return 0;}

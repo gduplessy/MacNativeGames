@@ -82,6 +82,34 @@ uint64_t cpu_call(cpu_thread *t, uint64_t fn, const uint64_t *args, unsigned nar
    the game compares stay consistent (as runtime_hle_wrap_named). name is kept for diagnostics. */
 uint64_t cpu_host_entry(cpu_bridge_fn bridge, void *fn, const char *name);
 
+/* Host code calling a guest function, written once for both backends:
+       GUEST_CALL(ret, fn_type, fn, args...)   GUEST_CALL0(ret, fn_type, fn)
+   On an ARM64 host (the native backend) this is exactly ((fn_type)(fn))(args...), the call the runtime made before.
+   With CPU_BACKEND_JIT it runs fn on the calling guest thread through cpu_call and converts x0 to ret. Integer and
+   pointer arguments only (up to 8): a float argument or result would need the v registers. */
+#define CPU_U64_(x) ((uint64_t)(uintptr_t)(x))
+#define CPU_NARGS_(...) CPU_NARGS_N_(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define CPU_NARGS_N_(a1, a2, a3, a4, a5, a6, a7, a8, n, ...) n
+#define CPU_CAT_(a, b) a##b
+#define CPU_CAT(a, b) CPU_CAT_(a, b)
+#define CPU_ARGS1_(a) CPU_U64_(a)
+#define CPU_ARGS2_(a, ...) CPU_U64_(a), CPU_ARGS1_(__VA_ARGS__)
+#define CPU_ARGS3_(a, ...) CPU_U64_(a), CPU_ARGS2_(__VA_ARGS__)
+#define CPU_ARGS4_(a, ...) CPU_U64_(a), CPU_ARGS3_(__VA_ARGS__)
+#define CPU_ARGS5_(a, ...) CPU_U64_(a), CPU_ARGS4_(__VA_ARGS__)
+#define CPU_ARGS6_(a, ...) CPU_U64_(a), CPU_ARGS5_(__VA_ARGS__)
+#define CPU_ARGS7_(a, ...) CPU_U64_(a), CPU_ARGS6_(__VA_ARGS__)
+#define CPU_ARGS8_(a, ...) CPU_U64_(a), CPU_ARGS7_(__VA_ARGS__)
+#ifdef CPU_BACKEND_JIT
+uint64_t cpu_guest_call(uint64_t fn, const uint64_t *args, unsigned nargs);   /* cpu_call on cpu_current() */
+#define GUEST_CALL(ret, fn_type, fn, ...) \
+    ((ret)cpu_guest_call(CPU_U64_(fn), (const uint64_t[]){CPU_CAT(CPU_ARGS, CPU_CAT(CPU_NARGS_(__VA_ARGS__), _))(__VA_ARGS__)}, CPU_NARGS_(__VA_ARGS__)))
+#define GUEST_CALL0(ret, fn_type, fn) ((ret)cpu_guest_call(CPU_U64_(fn), 0, 0))
+#else
+#define GUEST_CALL(ret, fn_type, fn, ...) (((fn_type)(fn))(__VA_ARGS__))
+#define GUEST_CALL0(ret, fn_type, fn) (((fn_type)(fn))())
+#endif
+
 /* Preemption from any host thread: t stops at the next block boundary and calls config.preempted, then continues. */
 void cpu_request_halt(cpu_thread *t);
 /* Guest code in [addr, addr+len) changed (load-time game patches): drop its translations. */

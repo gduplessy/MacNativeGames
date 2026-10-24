@@ -3,13 +3,13 @@
 // 523 slots (409 implemented, 83 from nvn_protos.h only, 31 without a signature), 13 extras, 57 marshallers.
 #include <stdint.h>
 #include "cpu_backend.h"
-#include "nvn.h"
 
-typedef struct { uint64_t v; } cpu_s8_t;   /* NVNseparateTextureHandle, NVNseparateSamplerHandle */
+typedef struct { uint64_t v; } cpu_s8_t;   /* an 8-byte struct: one x register, RAX on Windows x64 */
+typedef struct { _Alignas(16) uint8_t b[256]; } cpu_m256_t;   /* through x8; a hidden pointer on Windows x64 */
 
 // nvnDeviceRegisterFastClearDepth: nvn_protos.h says U8:I64,F32, the implementation (hle_nvn.c) is U8:I64; the bridge follows the implementation
-// nvnTextureBuilderGetMemoryPool: nvn_protos.h says MEM:NVNmemoryPool:I64, the implementation (totk_nvn_ext.c) is I64:I64; the bridge follows the implementation
-// nvnTextureGetMemoryPool: nvn_protos.h says MEM:NVNmemoryPool:I64, the implementation (totk_nvn_ext.c) is I64:I64; the bridge follows the implementation
+// nvnTextureBuilderGetMemoryPool: nvn_protos.h says MEM:256:I64, the implementation (totk_nvn_ext.c) is I64:I64; the bridge follows the implementation
+// nvnTextureGetMemoryPool: nvn_protos.h says MEM:256:I64, the implementation (totk_nvn_ext.c) is I64:I64; the bridge follows the implementation
 // nvnCommandBufferGetMemoryCallbackData: nvn_protos.h says V:I64, the implementation (hle_nvn.c) is I64:I64; the bridge follows the implementation
 
 static void br_F32__I64(cpu_regs *r, void *fn) { cpu_ret_f32(r, ((float (*)(uint64_t))fn)(cpu_arg_i64(r, 0))); }
@@ -21,7 +21,7 @@ static void br_I64__I64(cpu_regs *r, void *fn) { cpu_ret_i64(r, (uint64_t)((uint
 static void br_I64__I64_I32(cpu_regs *r, void *fn) { cpu_ret_i64(r, (uint64_t)((uint64_t (*)(uint64_t, int32_t))fn)(cpu_arg_i64(r, 0), cpu_arg_i32(r, 1))); }
 static void br_I64__I64_I32_I32(cpu_regs *r, void *fn) { cpu_ret_i64(r, (uint64_t)((uint64_t (*)(uint64_t, int32_t, int32_t))fn)(cpu_arg_i64(r, 0), cpu_arg_i32(r, 1), cpu_arg_i32(r, 2))); }
 static void br_I64__I64_I64(cpu_regs *r, void *fn) { cpu_ret_i64(r, (uint64_t)((uint64_t (*)(uint64_t, uint64_t))fn)(cpu_arg_i64(r, 0), cpu_arg_i64(r, 1))); }
-static void br_M_NVNmemoryPool__I64(cpu_regs *r, void *fn) { *(NVNmemoryPool *)(uintptr_t)r->x[8] = ((NVNmemoryPool (*)(uint64_t))fn)(cpu_arg_i64(r, 0)); }
+static void br_M256__I64(cpu_regs *r, void *fn) { *(cpu_m256_t *)(uintptr_t)r->x[8] = ((cpu_m256_t (*)(uint64_t))fn)(cpu_arg_i64(r, 0)); }
 static void br_S8__I64_I32(cpu_regs *r, void *fn) { cpu_ret_i64(r, ((cpu_s8_t (*)(uint64_t, int32_t))fn)(cpu_arg_i64(r, 0), cpu_arg_i32(r, 1)).v); }
 static void br_U8__I64(cpu_regs *r, void *fn) { cpu_ret_i64(r, (uint64_t)((uint8_t (*)(uint64_t))fn)(cpu_arg_i64(r, 0))); }
 static void br_U8__I64_I32(cpu_regs *r, void *fn) { cpu_ret_i64(r, (uint64_t)((uint8_t (*)(uint64_t, int32_t))fn)(cpu_arg_i64(r, 0), cpu_arg_i32(r, 1))); }
@@ -203,7 +203,7 @@ const cpu_bridge_fn nvn_bridge_sig[NVN_BRIDGE_SLOTS] = {
     br_V__I64,   /* 127 nvnBufferBuilderSetDefaults */
     br_V__I64_I64_I64_I64,   /* 128 nvnBufferBuilderSetStorage */
     0,   /* 129 nvnBufferBuilderGetDevice */
-    br_M_NVNmemoryPool__I64,   /* 130 nvnBufferBuilderGetMemoryPool */
+    br_M256__I64,   /* 130 nvnBufferBuilderGetMemoryPool */
     br_I64__I64,   /* 131 nvnBufferBuilderGetMemoryOffset */
     br_I64__I64,   /* 132 nvnBufferBuilderGetSize */
     br_U8__I64_I64,   /* 133 nvnBufferInitialize */
@@ -728,7 +728,7 @@ const char *const nvn_bridge_sigstr[NVN_BRIDGE_SLOTS] = {
     "V:I64",
     "V:I64,I64,I64,I64",
     "",
-    "MEM:NVNmemoryPool:I64",
+    "MEM:256:I64",
     "I64:I64",
     "I64:I64",
     "U8:I64,I64",

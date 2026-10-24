@@ -24,6 +24,7 @@
    over as soon as it is decoded. */
 #include "runtime.h"
 #include "movie_host.h"
+#include "cpu/cpu_backend.h"   /* GUEST_CALL: the decoder calls the movie library and nn::os in guest code */
 #include <arm_neon.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -67,6 +68,19 @@ typedef struct {
 } Movie;
 
 static MovieGuest G; static int g_ready;
+/* Calls into guest code (GUEST_CALL: a direct call on an ARM64 host, cpu_call under the jit backend). A bool result is
+   read as its low byte: AAPCS64 leaves the rest of w0 unspecified. movie_host_set_guest's host stand-ins (probe-movie)
+   are only callable on an ARM64 host. */
+static void guest_signal_event(void *e) { GUEST_CALL(void, void (*)(void *), G.signal_event, e); }
+static void guest_buf_set_range(void *b, int offset, int size) { GUEST_CALL(void, void (*)(void *, int, int), G.buf_set_range, b, offset, size); }
+static void guest_buf_set_data(void *b, void *data, size_t capacity) { GUEST_CALL(void, void (*)(void *, void *, size_t), G.buf_set_data, b, data, capacity); }
+static void *guest_buf_base(const void *b) { return GUEST_CALL(void *, void *(*)(const void *), G.buf_base, b); }
+static size_t guest_buf_capacity(const void *b) { return GUEST_CALL(size_t, size_t (*)(const void *), G.buf_capacity, b); }
+static bool guest_md_find_int32(const void *md, const char *key, int *value) { return GUEST_CALL(uint8_t, bool (*)(const void *, const char *, int *), G.md_find_int32, md, key, value) != 0; }
+static bool guest_md_find_string(const void *md, const char *key, const char **value) { return GUEST_CALL(uint8_t, bool (*)(const void *, const char *, const char **), G.md_find_string, md, key, value) != 0; }
+static void guest_md_set_int32(void *md, const char *key, int value) { GUEST_CALL(void, void (*)(void *, const char *, int), G.md_set_int32, md, key, value); }
+static void guest_md_set_rect(void *md, const char *key, int left, int top, int right, int bottom) { GUEST_CALL(void, void (*)(void *, const char *, int, int, int, int), G.md_set_rect, md, key, left, top, right, bottom); }
+static void guest_md_set_string(void *md, const char *key, const char *value) { GUEST_CALL(void, void (*)(void *, const char *, const char *), G.md_set_string, md, key, value); }
 static int g_negative = -1;   /* probe-movie negative controls only: 1 = U and V swapped, 2 = no format-changed event */
 static int negative(void) { if (g_negative < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); g_negative = e ? atoi(e) : 0; } return g_negative; }
 static uint64_t now_ns(void);
@@ -135,7 +149,7 @@ static Movie *find(const void *guest) {
 /* Events are signalled after the decoder's lock is released: the woken game thread calls straight back in. */
 typedef struct { void *ev[8]; int n; } Signals;
 static void note(Movie *m, Signals *s, int which) { if (m->events && m->events[which] && s->n < 8) s->ev[s->n++] = m->events[which]; }
-static void fire(const Signals *s) { for (int i = 0; i < s->n; i++) G.signal_event(s->ev[i]); }
+static void fire(const Signals *s) { for (int i = 0; i < s->n; i++) guest_signal_event(s->ev[i]); }
 
 static int frame_bytes(const Movie *m) { return m->w * m->h + (m->w / 2) * (m->h / 2) * 2; }
 
@@ -249,7 +263,7 @@ static void h_ctor(void *obj, int type, int format, int mode, int priority) {
     if (!g_ready) guest_init();
     if (type != TYPE_VP9 || mode != MODE_BUFFER) {
         LOG("decoder type %d mode %d format %d: left to the library (only VP9 in buffer mode runs on the host)", type, mode, format);
-        ((ctor_fn)G.orig[MOVIE_CTOR])(obj, type, format, mode, priority); return;
+        GUEST_CALL(void, ctor_fn, G.orig[MOVIE_CTOR], obj, type, format, mode, priority); return;
     }
     Movie *m = calloc(1, sizeof *m); if (!m) runtime_fail("movie decoder allocation");
     m->guest = obj; m->format = format; pthread_mutex_init(&m->mu, NULL);
@@ -272,17 +286,17 @@ static void destroy(void *obj) {
     ((void **)obj)[0] = G.vptr; ((void **)obj)[1] = NULL;   /* what the library's destructor leaves (no DecoderImpl) */
 }
 typedef void (*obj_fn)(void *);
-static void h_d2(void *obj) { if (!find(obj)) { ((obj_fn)G.orig[MOVIE_D2])(obj); return; } destroy(obj); }
+static void h_d2(void *obj) { if (!find(obj)) { GUEST_CALL(void, obj_fn, G.orig[MOVIE_D2], obj); return; } destroy(obj); }
 /* Deleting destructor: free the host state, then the library's own deleting destructor frees the object (impl now 0). */
-static void h_d0(void *obj) { if (find(obj)) destroy(obj); ((obj_fn)G.orig[MOVIE_D0])(obj); }
+static void h_d0(void *obj) { if (find(obj)) destroy(obj); GUEST_CALL(void, obj_fn, G.orig[MOVIE_D0], obj); }
 
 typedef int (*md_fn)(void *, void *);
 static int h_configure(void *obj, void *format) {
-    Movie *m = find(obj); if (!m) return ((md_fn)G.orig[MOVIE_CONFIGURE])(obj, format);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, md_fn, G.orig[MOVIE_CONFIGURE], obj, format);
     if (!format) return ST_NULL;
     if (m->format != FORMAT_NV12) { LOG("【红】output format %d not implemented on the host (NV12 = 4 only)", m->format); return ST_UNSUPPORTED; }
     const char *mime = NULL; int w = 0, h = 0;
-    G.md_find_string(format, "mime", &mime); G.md_find_int32(format, "width", &w); G.md_find_int32(format, "height", &h);
+    guest_md_find_string(format, "mime", &mime); guest_md_find_int32(format, "width", &w); guest_md_find_int32(format, "height", &h);
     if (!mime || strcmp(mime, "video/x-vnd.on2.vp9") || w <= 0 || h <= 0 || w > 8192 || h > 8192 || (w | h) & 1) {
         LOG("【红】configure: mime %s %dx%d not supported", mime ? mime : "(none)", w, h); return ST_UNSUPPORTED;
     }
@@ -299,28 +313,28 @@ static int h_configure(void *obj, void *format) {
     return ST_OK;
 }
 static int h_register_events(void *obj, void *events) {
-    Movie *m = find(obj); if (!m) return ((md_fn)G.orig[MOVIE_REGISTER_EVENTS])(obj, events);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, md_fn, G.orig[MOVIE_REGISTER_EVENTS], obj, events);
     m->events = events; return ST_OK;
 }
 static void set_format(Movie *m, void *md) {
-    G.md_set_string(md, "mime", "video/raw");
-    G.md_set_int32(md, "width", m->w); G.md_set_int32(md, "height", m->h);
-    G.md_set_int32(md, "stride", m->w); G.md_set_int32(md, "slice-height", m->h);
-    G.md_set_int32(md, "color-format", 21);   /* COLOR_FormatYUV420SemiPlanar */
-    G.md_set_rect(md, "crop", 0, 0, m->w - 1, m->h - 1);
-    G.md_set_int32(md, "crop-width", m->w); G.md_set_int32(md, "crop-height", m->h);
-    G.md_set_int32(md, "nv12-y-stride", m->w); G.md_set_int32(md, "nv12-uv-stride", m->w);
-    G.md_set_int32(md, "nv12-y-offset", 0); G.md_set_int32(md, "nv12-uv-offset", m->w * m->h);
+    guest_md_set_string(md, "mime", "video/raw");
+    guest_md_set_int32(md, "width", m->w); guest_md_set_int32(md, "height", m->h);
+    guest_md_set_int32(md, "stride", m->w); guest_md_set_int32(md, "slice-height", m->h);
+    guest_md_set_int32(md, "color-format", 21);   /* COLOR_FormatYUV420SemiPlanar */
+    guest_md_set_rect(md, "crop", 0, 0, m->w - 1, m->h - 1);
+    guest_md_set_int32(md, "crop-width", m->w); guest_md_set_int32(md, "crop-height", m->h);
+    guest_md_set_int32(md, "nv12-y-stride", m->w); guest_md_set_int32(md, "nv12-uv-stride", m->w);
+    guest_md_set_int32(md, "nv12-y-offset", 0); guest_md_set_int32(md, "nv12-uv-offset", m->w * m->h);
 }
 static int h_get_output_format(void *obj, void *md) {
-    Movie *m = find(obj); if (!m) return ((md_fn)G.orig[MOVIE_GET_OUTPUT_FORMAT])(obj, md);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, md_fn, G.orig[MOVIE_GET_OUTPUT_FORMAT], obj, md);
     if (!md) return ST_NULL;
     if (!m->configured) return ST_ERROR;
     set_format(m, md); return ST_OK;
 }
 typedef int (*int_fn)(void *);
 static int h_start(void *obj) {
-    Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_START])(obj);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, int_fn, G.orig[MOVIE_START], obj);
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
     if (!m->configured) { pthread_mutex_unlock(&m->mu); return ST_NOT_CONFIGURED; }
@@ -329,17 +343,17 @@ static int h_start(void *obj) {
     return ST_OK;
 }
 static int h_stop(void *obj) {
-    Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_STOP])(obj);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, int_fn, G.orig[MOVIE_STOP], obj);
     pthread_mutex_lock(&m->mu); LOG("stop after %llu frames (%llu dropped to keep time)", (unsigned long long)m->frames, (unsigned long long)m->dropped); release_codec(m); pthread_mutex_unlock(&m->mu);
     return ST_OK;
 }
 static int h_reset(void *obj) {
-    Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_RESET])(obj);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, int_fn, G.orig[MOVIE_RESET], obj);
     pthread_mutex_lock(&m->mu); release_codec(m); m->last_error = 0; pthread_mutex_unlock(&m->mu);
     return ST_OK;
 }
 static int h_flush(void *obj) {
-    Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_FLUSH])(obj);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, int_fn, G.orig[MOVIE_FLUSH], obj);
     pthread_mutex_lock(&m->mu);
     if (m->configured) {   /* drop queued work; the next input starts a new decode (after a seek: a key frame) */
         vpx_codec_destroy(&m->vpx); m->vpx_live = 0;
@@ -352,7 +366,7 @@ static int h_flush(void *obj) {
 }
 typedef int (*pp_fn)(void *, int *, int *);
 static int h_acquire_input(void *obj, int *index, int *remaining) {
-    Movie *m = find(obj); if (!m) return ((pp_fn)G.orig[MOVIE_ACQUIRE_INPUT])(obj, index, remaining);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, pp_fn, G.orig[MOVIE_ACQUIRE_INPUT], obj, index, remaining);
     if (!index || !remaining) return ST_NULL;
     pthread_mutex_lock(&m->mu);
     *index = -1; *remaining = 0; int st = ST_NO_INPUT;
@@ -364,15 +378,15 @@ static int h_acquire_input(void *obj, int *index, int *remaining) {
 }
 typedef int (*ib_fn)(void *, int, void *);
 static int h_get_input(void *obj, int index, void *buf) {
-    Movie *m = find(obj); if (!m) return ((ib_fn)G.orig[MOVIE_GET_INPUT])(obj, index, buf);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, ib_fn, G.orig[MOVIE_GET_INPUT], obj, index, buf);
     if (!buf) return ST_NULL;
-    if (index < 0 || index >= IN_BUFS || !m->in[index]) { G.buf_set_range(buf, 0, 0); G.buf_set_data(buf, NULL, 0); return ST_ERROR; }
-    G.buf_set_range(buf, 0, IN_CAP); G.buf_set_data(buf, m->in[index], IN_CAP);
+    if (index < 0 || index >= IN_BUFS || !m->in[index]) { guest_buf_set_range(buf, 0, 0); guest_buf_set_data(buf, NULL, 0); return ST_ERROR; }
+    guest_buf_set_range(buf, 0, IN_CAP); guest_buf_set_data(buf, m->in[index], IN_CAP);
     return ST_OK;
 }
 typedef int (*send_fn)(void *, int, int, int, int64_t, unsigned);
 static int h_send_input(void *obj, int index, int offset, int size, int64_t time, unsigned flags) {
-    Movie *m = find(obj); if (!m) return ((send_fn)G.orig[MOVIE_SEND_INPUT])(obj, index, offset, size, time, flags);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, send_fn, G.orig[MOVIE_SEND_INPUT], obj, index, offset, size, time, flags);
     if (index < 0 || index >= IN_BUFS || offset < 0 || size < 0 || (int64_t)offset + size > IN_CAP) return ST_ERROR;
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
@@ -385,7 +399,7 @@ static int h_send_input(void *obj, int index, int offset, int size, int64_t time
 }
 typedef int (*acq_fn)(void *, int *, int64_t *, unsigned *, int *);
 static int h_acquire_output(void *obj, int *index, int64_t *time, unsigned *flags, int *remaining) {
-    Movie *m = find(obj); if (!m) return ((acq_fn)G.orig[MOVIE_ACQUIRE_OUTPUT])(obj, index, time, flags, remaining);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, acq_fn, G.orig[MOVIE_ACQUIRE_OUTPUT], obj, index, time, flags, remaining);
     if (!index || !time || !flags || !remaining) return ST_NULL;
     pthread_mutex_lock(&m->mu);   /* paced frames become ready only at presents (movie_host_tick): one per game frame */
     *index = -1; *time = 0; *flags = 0; *remaining = 0; int st = ST_NO_OUTPUT;
@@ -397,28 +411,28 @@ static int h_acquire_output(void *obj, int *index, int64_t *time, unsigned *flag
     return st;
 }
 static int h_get_output(void *obj, int index, void *buf) {
-    Movie *m = find(obj); if (!m) return ((ib_fn)G.orig[MOVIE_GET_OUTPUT])(obj, index, buf);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, ib_fn, G.orig[MOVIE_GET_OUTPUT], obj, index, buf);
     if (!buf) return ST_NULL;
-    G.buf_set_range(buf, 0, 0);
+    guest_buf_set_range(buf, 0, 0);
     pthread_mutex_lock(&m->mu);
     int st = ST_ERROR;
     if (index >= 0 && index < OUT_BUFS && m->out_held[index]) {
-        int bytes = m->out_bytes[index]; uint8_t *dst = G.buf_base(buf);
+        int bytes = m->out_bytes[index]; uint8_t *dst = guest_buf_base(buf);
         if (!bytes) st = ST_OK;
-        else if (dst && G.buf_capacity(buf) >= (size_t)bytes) { memcpy(dst, m->out[index], (size_t)bytes); G.buf_set_range(buf, 0, bytes); st = ST_OK; }
-        else LOG("【红】output buffer of %zu bytes for a %d-byte frame", G.buf_capacity(buf), bytes);
+        else if (dst && guest_buf_capacity(buf) >= (size_t)bytes) { memcpy(dst, m->out[index], (size_t)bytes); guest_buf_set_range(buf, 0, bytes); st = ST_OK; }
+        else LOG("【红】output buffer of %zu bytes for a %d-byte frame", guest_buf_capacity(buf), bytes);
     }
     pthread_mutex_unlock(&m->mu); return st;
 }
 static int h_get_output_size(void *obj, int *size, int *count) {
-    Movie *m = find(obj); if (!m) return ((pp_fn)G.orig[MOVIE_GET_OUTPUT_SIZE])(obj, size, count);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, pp_fn, G.orig[MOVIE_GET_OUTPUT_SIZE], obj, size, count);
     if (!size || !count) return ST_NULL;
     *count = 1; *size = m->configured ? frame_bytes(m) : 0;
     return ST_OK;
 }
 typedef int (*i_fn)(void *, int);
 static int h_release_output(void *obj, int index) {
-    Movie *m = find(obj); if (!m) return ((i_fn)G.orig[MOVIE_RELEASE_OUTPUT])(obj, index);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, i_fn, G.orig[MOVIE_RELEASE_OUTPUT], obj, index);
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
     int st = ST_ERROR;
@@ -431,18 +445,18 @@ static int h_release_output(void *obj, int index) {
     return st;
 }
 static int h_get_last_error(void *obj) {
-    Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_GET_LAST_ERROR])(obj);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, int_fn, G.orig[MOVIE_GET_LAST_ERROR], obj);
     return m->last_error;
 }
 typedef int (*ibm_fn)(void *, int, void *, void *);
 static int h_get_output_buffer_format(void *obj, int index, void *md) {
-    Movie *m = find(obj); if (!m) return ((ib_fn)G.orig[MOVIE_GET_OUTPUT_BUFFER_FORMAT])(obj, index, md);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, ib_fn, G.orig[MOVIE_GET_OUTPUT_BUFFER_FORMAT], obj, index, md);
     if (!md) return ST_NULL;
     if (index < 0 || index >= OUT_BUFS || !m->out_held[index]) return ST_ERROR;
     set_format(m, md); return ST_OK;
 }
 static int h_get_output_md(void *obj, int index, void *buf, void *md) {
-    Movie *m = find(obj); if (!m) return ((ibm_fn)G.orig[MOVIE_GET_OUTPUT_MD])(obj, index, buf, md);
+    Movie *m = find(obj); if (!m) return GUEST_CALL(int, ibm_fn, G.orig[MOVIE_GET_OUTPUT_MD], obj, index, buf, md);
     if (!buf && !md) return ST_NULL;
     int st = md ? h_get_output_buffer_format(obj, index, md) : ST_OK;
     return st == ST_OK && buf ? h_get_output(obj, index, buf) : st;

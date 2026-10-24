@@ -4,8 +4,12 @@
 // 8-byte struct arguments from x0..x7 in order (32-bit ones from wN, 8-bit ones from the low byte), float / double
 // arguments from v0..v7 in their own order, a large struct result through x8. Probes (generated with --probes) have
 // each marshaller's host C signature and record what they receive.
-//   M  every marshaller, called directly with random register frames (upper halves of xN and qN are garbage)
-//   E  every NVN name with a signature, end to end: guest code loads the registers and BLRs to its host-entry stub
+//   M  every marshaller (nvn_bridge.c and hle_bridge.c), called directly with random register frames (upper halves of
+//      xN and qN are garbage)
+//   L  hle_bridge_for_import finds every bridged import and nothing else
+//   E  every NVN name with a signature and every HLE import, end to end: guest code loads the registers and BLRs to the
+//      host-entry stub
+//   G  GUEST_CALL (guest_call_test.c) from host code inside a bridge, into guest code
 //   S  svc passthrough: the handler sees the gate frame, its x1 reaches the guest, x18 and NZCV survive
 //   N  a host function that calls back into guest code (nested cpu_call), callee-saved x19 kept
 //   D  stores to a write-protected guest page: the runtime's VEH unprotects, the JIT resumes, values land
@@ -37,6 +41,12 @@ extern const unsigned nvn_bridge_nextras;
 typedef struct { const char *sig; void *probe; } probe_entry;
 extern const probe_entry probe_table[];
 extern const unsigned probe_count;
+typedef struct { const char *symbol; cpu_bridge_fn bridge; const char *sig; const char *host; } hle_bridge_import;
+extern const hle_bridge_import hle_bridge_imports[];
+extern const unsigned hle_bridge_nimports;
+cpu_bridge_fn hle_bridge_for_import(const char *symbol);
+typedef struct { uint64_t fn[7]; int jit; } gc_fns;   // guest_call_test.c
+int gc_run(const gc_fns *g);
 extern uint64_t probe_seen[16];
 extern unsigned probe_nseen;
 }
@@ -83,8 +93,8 @@ static void check_result(const Sig &s, const cpu_regs &before, const cpu_regs &a
     else if (s.ret == "F32") { float f = static_cast<float>(h % 100000) / 7.0f; check(memcmp(after.q[0], &f, 4) == 0, "result F32 in s0", who); }
     else if (s.ret == "F64") { double d = static_cast<double>(h % 100000) / 7.0; check(memcmp(after.q[0], &d, 8) == 0, "result F64 in d0", who); }
     else if (s.ret.rfind("MEM:", 0) == 0) {
-        const uint8_t *m = reinterpret_cast<const uint8_t *>(before.x[8]); bool ok = true;
-        for (size_t i = 0; i < 256; i++) ok &= m[i] == (static_cast<uint8_t>(h >> (i % 8 * 8)) ^ static_cast<uint8_t>(i));
+        const uint8_t *m = reinterpret_cast<const uint8_t *>(before.x[8]); bool ok = true; const size_t size = std::stoul(s.ret.substr(4));
+        for (size_t i = 0; i < size; i++) ok &= m[i] == (static_cast<uint8_t>(h >> (i % 8 * 8)) ^ static_cast<uint8_t>(i));
         check(ok, "struct result written through x8", who);
     }
 }
@@ -147,14 +157,21 @@ int main() {
     std::unordered_map<std::string, cpu_bridge_fn> bridge_by_sig;
     for (unsigned i = 0; i < NVN_BRIDGE_SLOTS; i++) if (nvn_bridge_sig[i]) bridge_by_sig[nvn_bridge_sigstr[i]] = nvn_bridge_sig[i];
     for (unsigned i = 0; i < nvn_bridge_nextras; i++) bridge_by_sig[nvn_bridge_extras[i].sig] = nvn_bridge_extras[i].bridge;
+    // the HLE marshallers are separate copies (hle_bridge.c): test both when a signature appears in both files
+    std::vector<std::pair<std::string, cpu_bridge_fn>> hle_marshallers;
+    { std::unordered_map<std::string, cpu_bridge_fn> seen;
+      for (unsigned i = 0; i < hle_bridge_nimports; i++) if (seen.emplace(hle_bridge_imports[i].sig, hle_bridge_imports[i].bridge).second) hle_marshallers.emplace_back(hle_bridge_imports[i].sig, hle_bridge_imports[i].bridge); }
     std::unordered_map<std::string, void *> probe_by_sig;
     for (unsigned i = 0; i < probe_count; i++) probe_by_sig[probe_table[i].sig] = probe_table[i].probe;
-    check(bridge_by_sig.size() == probe_count, "one probe per marshaller", std::to_string(bridge_by_sig.size()) + " vs " + std::to_string(probe_count));
+    std::vector<std::pair<std::string, cpu_bridge_fn>> marshallers(bridge_by_sig.begin(), bridge_by_sig.end());
+    marshallers.insert(marshallers.end(), hle_marshallers.begin(), hle_marshallers.end());
+    { std::unordered_map<std::string, int> sigs; for (auto &m : marshallers) sigs[m.first]++;
+      check(sigs.size() == probe_count, "one probe per signature class", std::to_string(sigs.size()) + " vs " + std::to_string(probe_count)); }
     std::mt19937_64 rng(20261023);
 
-    // M: every marshaller, 200 random frames each
+    // M: every marshaller of both files, 200 random frames each
     unsigned m_calls = 0;
-    for (auto &[sig, bridge] : bridge_by_sig) {
+    for (auto &[sig, bridge] : marshallers) {
         Sig s = parse(sig); void *probe = probe_by_sig[sig];
         for (int k = 0; k < 200; k++) {
             cpu_regs r; random_frame(r, rng); const cpu_regs before = r;
@@ -166,7 +183,14 @@ int main() {
             if (s.ret == "V" || s.ret.rfind("MEM:", 0) == 0) check(r.x[0] == before.x[0], "M x0 untouched by a void / struct result", sig);
         }
     }
-    std::printf("m_marshallers=%zu m_calls=%u\n", bridge_by_sig.size(), m_calls);
+    std::printf("m_marshallers=%zu (nvn %zu, hle %zu) m_calls=%u\n", marshallers.size(), bridge_by_sig.size(), hle_marshallers.size(), m_calls);
+
+    // L: hle_bridge_for_import finds every import (the table is sorted for its binary search) and nothing else
+    { bool sorted = true; for (unsigned i = 1; i < hle_bridge_nimports; i++) sorted &= std::strcmp(hle_bridge_imports[i - 1].symbol, hle_bridge_imports[i].symbol) < 0;
+      check(sorted, "L import table strictly sorted");
+      for (unsigned i = 0; i < hle_bridge_nimports; i++) check(hle_bridge_for_import(hle_bridge_imports[i].symbol) == hle_bridge_imports[i].bridge, "L lookup finds the import", hle_bridge_imports[i].symbol);
+      check(!hle_bridge_for_import("_ZN2nn2os99NotReplacedEv") && !hle_bridge_for_import(""), "L lookup misses an unreplaced import");
+      std::printf("l_imports=%u\n", hle_bridge_nimports); }
 
     oaknut::CodeGenerator g(reinterpret_cast<u32 *>(CODE));
     const u64 trampoline = emit_trampoline(g);
@@ -179,6 +203,16 @@ int main() {
     g.MOV(X10, DATA + 0x300); g.STP(X0, X19, X10, 0); g.LDR(X19, SP, 16); g.LDP(X29, X30, SP, POST_INDEXED, 32); g.RET();
     const u64 dirty_code = here(g);   // D: store x1 words of i*3 at x0
     { oaknut::Label l; g.MOV(X2, 0); g.l(l); g.ADD(X3, X2, X2, oaknut::AddSubShift::LSL, 1); g.STR(X3, X0, POST_INDEXED, 8); g.ADD(X2, X2, 1); g.CMP(X2, X1); g.B(oaknut::Cond::NE, l); g.RET(); }
+    // G: guest functions for guest_call_test.c (roles listed there), and a trampoline that calls the stub in x0
+    gc_fns gcf{}; gcf.jit = 1;
+    gcf.fn[0] = here(g); g.MOV(X9, X0); for (int k = 1; k < 8; k++) { g.MOV(X10, k + 1); g.MADD(X9, oaknut::XReg(k), X10, X9); } g.MOV(X0, X9); g.RET();
+    gcf.fn[1] = here(g); g.SXTW(X0, W0); g.RET();
+    gcf.fn[2] = here(g); g.STR(X1, X0, 0); g.RET();
+    gcf.fn[3] = here(g); g.ADD(X0, X0, 16); g.RET();
+    gcf.fn[4] = here(g); g.MOV(X0, 42); g.RET();
+    gcf.fn[5] = here(g); g.RET();   // w0 = the argument, upper bits included
+    gcf.fn[6] = here(g); g.MOV(X0, 0xdead0000fffffffeull); g.RET();
+    const u64 call_x0 = here(g); g.STP(X29, X30, SP, PRE_INDEXED, -16); g.BLR(X0); g.LDP(X29, X30, SP, POST_INDEXED, 16); g.RET();
     const u64 spin_code = here(g);   // P: count until [x0] != 0
     { oaknut::Label l; g.MOV(X1, 0); g.l(l); g.ADD(X1, X1, 1); g.LDR(X2, X0, 0); g.CBZ(X2, l); g.MOV(X0, X1); g.RET(); }
 
@@ -208,7 +242,16 @@ int main() {
     };
     for (unsigned i = 0; i < NVN_BRIDGE_SLOTS; i++) if (nvn_bridge_sig[i]) { char nm[16]; std::snprintf(nm, sizeof nm, "slot %u", i); run_name(nm, nvn_bridge_sigstr[i], nvn_bridge_sig[i]); }
     for (unsigned i = 0; i < nvn_bridge_nextras; i++) run_name(nvn_bridge_extras[i].name, nvn_bridge_extras[i].sig, nvn_bridge_extras[i].bridge);
-    std::printf("e_names=%u e_calls=%u\n", e_names, e_calls);
+    const unsigned e_nvn = e_names;
+    for (unsigned i = 0; i < hle_bridge_nimports; i++) run_name(hle_bridge_imports[i].symbol, hle_bridge_imports[i].sig, hle_bridge_imports[i].bridge);
+    std::printf("e_names=%u (nvn %u, hle imports %u) e_calls=%u\n", e_names, e_nvn, e_names - e_nvn, e_calls);
+
+    // G: GUEST_CALL from host code inside a bridge (the observers' and movie_host.c's situation)
+    { static gc_fns *gp; gp = &gcf;
+      const u64 entry = cpu_host_entry([](cpu_regs *r, void *fn) { r->x[0] = static_cast<u64>(reinterpret_cast<int (*)(const gc_fns *)>(fn)(gp)); },
+                                       reinterpret_cast<void *>(gc_run), "gc_run");
+      const u64 failed = cpu_call(t, call_x0, &entry, 1, STACK_TOP);
+      check(failed == 0, "G GUEST_CALL forms under the jit backend", std::to_string(failed) + " failed"); }
 
     // S: svc passthrough
     { u64 *o = reinterpret_cast<u64 *>(DATA + 0x200); const u64 arg = DATA + 0x200; cpu_call(t, svc_code, &arg, 1, STACK_TOP);
