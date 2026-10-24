@@ -306,8 +306,9 @@ add one as an optional later improvement, or rely on AOT (9.3) for that.
 **Risks.**
 - Upstream maintenance: `merryhime/dynarmic` is gone and `lioncash/dynarmic` was archived on 2024-03-03 (X-S2).
   Pin `a41c380` in a project-owned fork, evaluate Eden's in-tree A64 fixes, and expect to own fixes.
-- No ARMv8.1 LSE in dynarmic: retail Switch code is ARMv8.0, but guest-side code this project injects (thunks,
-  patch blocks) must avoid LSE (`nvn_thunks.S` uses `stadd` today).
+- No ARMv8.1 LSE in dynarmic: retail Switch code is ARMv8.0, but code this project places in guest memory (rewriter
+  patch blocks, host-entry stubs) must avoid LSE. `nvn_thunks.S` (`stadd`) is host code on ARM64 and is never run by
+  the JIT, which uses `svc; ret` stubs instead.
 - "Not an emulator" positioning: the CPU path on x86-64 becomes an emulator CPU core. Everything else stays HLE and
   native. Say so plainly in the README.
 - FP accuracy settings: dynarmic's fast-FP options trade accuracy for speed. Start accurate, then measure.
@@ -425,15 +426,45 @@ Results so far (2026-10-23, i7-5820K + RTX 3060; probes and full tables in
   - Two plan changes follow:
     1. dynarmic upstream is deleted or archived, so the project owns a fork.
     2. dynarmic has no ARMv8.1 LSE. That is fine for retail code, which targets the ARMv8.0 Cortex-A57, but every
-       instruction this project injects into guest code must stay ARMv8.0. `nvn_thunks.S` currently uses `stadd`.
+       instruction this project places in guest memory must stay ARMv8.0: rewriter patch blocks and the JIT's
+       host-entry stubs. (`nvn_thunks.S` uses `stadd`, but it is host code on ARM64; the JIT never runs it.)
 
 #### Phase X1: CPU backend interface + ABI bridge (5-6 wk)
-- [ ] `cpu_backend.h`; the current ARM64 path becomes the `native` backend with no behavior change (Mac hash parity).
-- [ ] `gen_protos.py --abi x64-bridge` for NVN; bridge tables for svc gates and host cuts; host → guest entry.
-- [ ] `DM_TARGET=x64` rewriter profile (cuts and patches only) + `expected-*-x64.json`.
-- [ ] Guest-at-own-address reservation on Windows x64 (`VirtualAlloc2` placeholders, as in phase 5).
-- [ ] Acceptance: an x64 unit test calls 50 NVN entry points through the bridge from a synthetic guest context and
-      matches the ARM64 thunk results.
+- [x] `runtime/cpu/cpu_backend.h`. The register context is gate.S's 800-byte frame, byte for byte, so `runtime_svc`
+      and every HLE service run unchanged on either backend. It covers:
+      - init and threads;
+      - `cpu_call` (host → guest, nests);
+      - `cpu_host_entry` (guest → host);
+      - `cpu_request_halt` with a `preempted` callback;
+      - `cpu_invalidate_code`.
+- [x] `runtime/cpu/cpu_jit.cpp`: the dynarmic backend.
+  - Fastmem base 0 and 39 address bits; svc served outside `Run()`.
+  - Host entries are `svc #0x8000+i; ret` stubs; `cpu_call` returns through a `svc #0x7fff` stub.
+  - Faults resume through SEH-guarded copies, so the runtime's VEH sees a write-protected page first.
+- [x] `tools/gen_cpu_bridge.py` generates `runtime/cpu/nvn_bridge.c` (in place of a `gen_protos.py` mode: that tool
+      is not in this repository). Inputs and results:
+  - Signatures come from the `NVN`/`NVN_NOPROTO`/`NVN_EXTRA` implementations first, then from `nvn_protos.h`.
+  - 523 slots: 409 implemented, 83 prototype-only, 31 with no signature. Plus 13 extras, all collapsing to 57
+    marshallers.
+  - It found 4 places where `nvn_protos.h` disagrees with the implementation, e.g. `nvnTextureGetMemoryPool` returns
+    a pointer, not `NVNmemoryPool` by value. The bridge follows the implementation, as an ARM64 call does.
+- [x] Acceptance, exceeded: `games/totk/tests/cpu_bridge` (`build.cmd`, `run.cmd`, Windows x64) passes **37,078
+      checks** against an independent AAPCS64 model:
+  - every marshaller × 200 random frames;
+  - **all 505 NVN names** with a signature, end to end through the JIT;
+  - svc passthrough, nested host → guest calls, dirty-tracking resume, and exactly one preemption callback per halt.
+  - Negative control: a bridge numbered by position (the Windows x64 rule) fails 1,240 checks.
+  - `tests/test_cpu_bridge.py` (in `make check`) keeps the committed bridge current on every platform.
+  - Not yet compared against the ARM64 thunks on real hardware; that needs a Mac.
+- [ ] Wire the `native` backend into the runtime (gate.S, hle_stack.S and threads.c behind `cpu_backend.h`). This
+      needs a Mac to prove hash parity, so nothing in the Mac/iOS build changes yet: `runtime/cpu/` is outside the
+      Makefile's `runtime/*.c` glob and excluded in `ios/project.yml`.
+- [ ] Bridge the non-NVN host functions: the 16 `runtime_*_override` tables plus `runtime_observer` (same
+      generator, reading each table's C function signatures). Route the 5 host → guest cast-and-call sites (e.g.
+      `observed_region` calling the guest `AllocateAddressRegion`) through `cpu_call`.
+- [ ] Make `NVN`/`HLE_FORCE` registration portable: they use Mach-O `__attribute__((section("__DATA,…")))`.
+- [ ] `DM_TARGET=x64` rewriter profile (cuts and patches only) + `expected-*-x64.json` (needs the player's dump).
+- [ ] Guest-at-own-address reservation on Windows x64 in `services.c` (`VirtualAlloc2` placeholders, X-S1 layout).
 
 #### Phase X2: JIT backend, Windows x64 playable (8-10 wk)
 - [ ] dynarmic integration: per-thread JIT, shared exclusive monitor, fastmem base 0, svc/sysreg/counter callbacks.

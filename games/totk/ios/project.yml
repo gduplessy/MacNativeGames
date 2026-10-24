@@ -18,6 +18,7 @@ targets:
           - frontend.m
           - loader.c
           - game_patches_botw.c
+          - cpu/**   # CPU backends for x86-64 hosts (dynarmic); an ARM64 device runs the game's code directly
       - path: ../third_party/d2r_gfx/gfx/nvn
       - path: ../third_party/d2r_gfx/gfx/tex
       - path: Gen/embed.S
